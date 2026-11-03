@@ -1,0 +1,30 @@
+services:
+  open_h_site:
+    container_name: open_h_site
+    build:
+      context: .
+      dockerfile: open-h-site/Dockerfile
+    image: open-h/site:${OPEN_H_SITE_VERSION:-dev}
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.openh-site.loadbalancer.server.port: "8080"
+      traefik.http.routers.openh-site.rule: Host(`www.open-h.org`)
+      traefik.http.routers.openh-site.entrypoints: websecure
+      traefik.http.routers.openh-site.tls.certresolver: lets-encrypt-http
+      traefik.http.routers.openh-apex.rule: Host(`open-h.org`)
+      traefik.http.routers.openh-apex.entrypoints: websecure
+      traefik.http.routers.openh-apex.tls.certresolver: lets-encrypt
+      traefik.http.routers.openh-apex.middlewares: openh-canonical
+      traefik.http.routers.openh-apex.service: openh-site
+      traefik.http.middlewares.openh-canonical.redirectregex.regex: ^https?://open-h\.org/(.*)
+      traefik.http.middlewares.openh-canonical.redirectregex.replacement: https://www.open-h.org/$${1}
+      traefik.http.middlewares.openh-canonical.redirectregex.permanent: "true"
+    networks:
+      - cvat

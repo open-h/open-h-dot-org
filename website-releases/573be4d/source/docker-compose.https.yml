@@ -1,0 +1,41 @@
+# Copyright (C) 2018-2022 Intel Corporation
+#
+# SPDX-License-Identifier: MIT
+
+services:
+  cvat_server:
+    labels:
+      traefik.http.routers.cvat.rule:
+        Host(`${CVAT_HOST:-localhost}`) &&
+        (PathPrefix(`/api/`) || PathPrefix(`/static/`) || PathPrefix(`/admin`)
+          || PathPrefix(`/django-rq`))
+      traefik.http.routers.cvat.entrypoints: websecure
+      traefik.http.routers.cvat.tls.certresolver: lets-encrypt
+
+  cvat_ui:
+    labels:
+      traefik.http.routers.cvat-ui.rule: Host(`${CVAT_HOST:-localhost}`)
+      traefik.http.routers.cvat-ui.entrypoints: websecure
+      traefik.http.routers.cvat-ui.tls.certresolver: lets-encrypt
+
+  traefik:
+    environment:
+      TRAEFIK_ENTRYPOINTS_web_ADDRESS: :80
+      TRAEFIK_ENTRYPOINTS_web_HTTP_REDIRECTIONS_ENTRYPOINT_TO: websecure
+      TRAEFIK_ENTRYPOINTS_web_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME: https
+      TRAEFIK_ENTRYPOINTS_websecure_ADDRESS: :443
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt_ACME_EMAIL: "${ACME_EMAIL:?Please set the ACME_EMAIL env variable}"
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt_ACME_TLSCHALLENGE: "true"
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt_ACME_STORAGE: /letsencrypt/acme.json
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt-http_ACME_EMAIL: "${ACME_EMAIL:?Please set the ACME_EMAIL env variable}"
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt-http_ACME_HTTPCHALLENGE: "true"
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt-http_ACME_HTTPCHALLENGE_ENTRYPOINT: web
+      TRAEFIK_CERTIFICATESRESOLVERS_lets-encrypt-http_ACME_STORAGE: /letsencrypt/acme-http.json
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - cvat_letsencrypt:/letsencrypt
+
+volumes:
+  cvat_letsencrypt:

@@ -1,0 +1,207 @@
+# Surgery platform overlay for CVAT
+# Usage: docker compose -f docker-compose.yml -f docker-compose.surgery.yml up -d
+#
+# Prerequisites:
+#   - Copy .env.surgery.example to .env and edit with your settings
+#   - Ensure GPU drivers are installed (nvidia-container-toolkit)
+#
+# This adds:
+#   - Surgery-specific env vars to all backend services
+#   - Parakeet ASR service (NeMo, GPU)
+#   - LLM service (llama-cpp-python or remote API)
+#   - SAM3 interactive segmentation sidecar (GPU)
+
+x-surgery-env: &surgery-env
+  # Transcription pipeline
+  TRANSCRIPTION_ASR_URL: ${TRANSCRIPTION_ASR_URL:-http://parakeet:8888/asr}
+  TRANSCRIPTION_LLM_ENABLED: ${TRANSCRIPTION_LLM_ENABLED:-0}
+  # Copilot LLM pipeline
+  NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+  COPILOT_LLM_URL: ${COPILOT_LLM_URL:-}
+  COPILOT_LLM_MODEL: ${COPILOT_LLM_MODEL:-}
+  COPILOT_LLM_API_KEY: ${COPILOT_LLM_API_KEY:-}
+  COPILOT_LLM_API_KEY_FILE: ${COPILOT_LLM_API_KEY_FILE:-/run/secrets/copilot_opus_api_key}
+  COPILOT_LLM_VISION_ENABLED: ${COPILOT_LLM_VISION_ENABLED:-}
+
+services:
+  # ── Override CVAT backend services with surgery env vars ──
+
+  cvat_server:
+    environment:
+      <<: *surgery-env
+
+  cvat_worker_annotation:
+    environment:
+      <<: *surgery-env
+
+  cvat_worker_import:
+    environment:
+      <<: *surgery-env
+
+  cvat_worker_webhooks:
+    environment:
+      <<: *surgery-env
+
+  sam3:
+    container_name: surgery_sam3
+    build:
+      context: .
+      dockerfile: components/sam3/Dockerfile
+      network: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SAM3_ROOT: /opt/sam3
+      SAM3_CHECKPOINT_DIR: /opt/checkpoints
+      SAM3_BASE_CHECKPOINT: /opt/checkpoints/Altas_Sam3.pt
+      SAM3_WARMUP_ON_STARTUP: ${SAM3_WARMUP_ON_STARTUP:-0}
+      SAM3_MAX_RESIDENT_MODELS: ${SAM3_MAX_RESIDENT_MODELS:-2}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./components/vendor/repo_sam3.1:/opt/sam3:ro
+      - ${OPENHV2_SAM3_CKPT_DIR:-/mnt/big_drive/models/openhv2/sam3/checkpoints}:/opt/checkpoints:ro
+      - ${OPENHV2_HF_CACHE:-/mnt/big_drive/models/openhv2/cache/hf}:/root/.cache/huggingface
+    expose:
+      - "8090"
+    networks:
+      - cvat
+
+  # ── Temporal predictor (V-JEPA-2.1 + ASFormer) ──
+  temporal_predictor:
+    image: cvat-sam3:latest
+    container_name: surgery_temporal
+    restart: unless-stopped
+    working_dir: /opt/temporal
+    command: ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8091"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SURGVID_VJEPA2_REPO: /opt/vendor/vjepa2
+      SURGVID_ASFORMER_DIR: /opt/vendor/asformer_model
+      SURGVID_INFER_DIR: /opt/infer_guides
+      ASFORMER_CHECKPOINT: /opt/weights/asformer_best.pt
+      ASFORMER_CONFIG: /opt/weights/asformer_config.yaml
+      VJEPA_BACKBONE: /opt/weights/vjepa2_1_vitl_dist_vitG_384.pt
+      TEMPORAL_DATASET_ROOTS: /data/prostatectomy:/data/prostatectomy_suture_knot_focused
+      TORCH_HOME: /tmp/torch
+    volumes:
+      - ./components/temporal_predictor:/opt/temporal:ro
+      - ./components/vendor/vjepa2:/opt/vendor/vjepa2:ro
+      - ./components/vendor/asformer_model:/opt/vendor/asformer_model:ro
+      - ./components/inference_guides:/opt/infer_guides:ro
+      - ${OPENHV2_TEMPORAL_WEIGHTS:-/mnt/big_drive/models/openhv2/temporal}:/opt/weights:ro
+      - ${OPENHV2_DATASET_PROST:-/mnt/big_drive/datasets/prostatectomy}:/data/prostatectomy:ro
+      - ${OPENHV2_DATASET_PROST_SUTURE:-/mnt/big_drive/datasets/prostatectomy_suture_knot_focused}:/data/prostatectomy_suture_knot_focused:ro
+    expose:
+      - "8091"
+    networks:
+      - cvat
+
+  # ── TAPIS surgical phase predictor ──
+  tapis_phase_predictor:
+    image: cvat-sam3:latest
+    container_name: surgery_tapis_phase
+    restart: unless-stopped
+    working_dir: /opt/tapis
+    command: ["bash", "-c", "pip install --quiet --no-input fvcore simplejson && exec python -m uvicorn server:app --host 0.0.0.0 --port 8602"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      TAPIS_ROOT: /opt/tapis_code
+      TAPIS_STUBS: /opt/tapis_stubs
+      TAPIS_PHASE_CHECKPOINT: /opt/models/fold1/PHASES.pyth
+      TAPIS_PHASE_CONFIG: /opt/tapis_code/configs/GraSP/TAPIS/TAPIS_PHASES.yaml
+      TEMPORAL_DATASET_ROOTS: /data/prostatectomy:/data/prostatectomy_suture_knot_focused
+      TAPIS_KEYFRAME_EVERY_S: "1"
+      TORCH_HOME: /tmp/torch
+    volumes:
+      - ./components/tapis_phase_predictor:/opt/tapis:ro
+      - ${OPENHV2_TAPIS_CODE:-/mnt/ssd2/GraSP/TAPIS}:/opt/tapis_code:ro
+      - ./components/tapis_phase/stubs:/opt/tapis_stubs:ro
+      - ${OPENHV2_TAPIS_MODELS:-/mnt/big_drive/models/openhv2/tapis}:/opt/models:ro
+      - ${OPENHV2_DATASET_PROST:-/mnt/big_drive/datasets/prostatectomy}:/data/prostatectomy:ro
+      - ${OPENHV2_DATASET_PROST_SUTURE:-/mnt/big_drive/datasets/prostatectomy_suture_knot_focused}:/data/prostatectomy_suture_knot_focused:ro
+    expose:
+      - "8602"
+    networks:
+      - cvat
+
+  # ── Parakeet ASR service (NVIDIA NeMo) ──
+  # Runs Parakeet-TDT for speech-to-text
+  # Requires NVIDIA GPU with >= 4GB VRAM
+
+  parakeet:
+    container_name: surgery_parakeet
+    build:
+      context: components/parakeet_asr
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SURGNARR_SRC: /opt/surgnarr/src
+      PARAKEET_MODEL: ${PARAKEET_MODEL:-nvidia/parakeet-tdt-1.1b}
+      PARAKEET_DEVICE: cuda
+      HF_HOME: /opt/hf
+    volumes:
+      - ./components/surgnarr_src:/opt/surgnarr/src:ro
+      - ${OPENHV2_PARAKEET_HF:-/mnt/big_drive/models/openhv2/cache/hf}:/opt/hf
+    ports:
+      - "${PARAKEET_PORT:-8888}:8888"
+    networks:
+      - cvat
+
+  # ── LLM service (llama-cpp-python) ──
+  # Runs a local LLM with OpenAI-compatible API
+  # Set LLM_MODE=remote in .env to skip this and use an external API
+
+  llm:
+    container_name: surgery_llm
+    image: ghcr.io/abetlen/llama-cpp-python:latest
+    restart: unless-stopped
+    profiles:
+      - local-llm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      MODEL: /models/${LLM_MODEL_FILE:-model.gguf}
+      N_GPU_LAYERS: -1
+      CHAT_FORMAT: chatml
+    volumes:
+      - surgery_models:/models
+    ports:
+      - "${LLM_PORT:-8080}:8000"
+    networks:
+      - cvat
+
+volumes:
+  surgery_models:
+  surgery_hf_cache:

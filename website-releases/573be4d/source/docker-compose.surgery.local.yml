@@ -1,0 +1,172 @@
+# SAM 3.1 + temporal + TAPIS + Parakeet overlay.
+#
+# Source trees are now VENDORED into the repo under cvat_ai/components/ and mounted via
+# RELATIVE paths, so this works on any machine that has the repo (no absolute host paths
+# for source). Only model WEIGHTS and DATASETS are external, parameterized via env vars
+# with safe defaults:
+#
+#   OPENHV2_SAM3_CKPT_DIR     host dir with SAM3 .pt checkpoints      -> /opt/checkpoints
+#   OPENHV2_TAPIS_CODE        host dir with GraSP/TAPIS source        -> /opt/tapis_code
+#   OPENHV2_TAPIS_MODELS      host dir with tapis/fold1/PHASES.pyth   -> /opt/models
+#   OPENHV2_TEMPORAL_WEIGHTS  host dir with asformer_best.pt + asformer_config.yaml
+#                             + vjepa2_1_vitl_dist_vitG_384.pt        -> /opt/weights
+#   OPENHV2_HF_CACHE / OPENHV2_PARAKEET_HF   huggingface caches
+#   OPENHV2_DATASET_PROST / OPENHV2_DATASET_PROST_SUTURE   dataset roots -> /data/...
+#
+# The defaults point at this deployment box. On another server, override these to where
+# the weights bundle was extracted. See planning/SESSION_HANDOFF.md + docs/OPERATOR_SETUP.md.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#     -f docker-compose.surgery.local.yml up -d
+
+services:
+  cvat_server:
+    environment:
+      DJANGO_SETTINGS_MODULE: cvat.settings.dev_override
+      COPILOT_LLM_URL: "https://inference-api.nvidia.com:8443/v1/chat/completions"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "inference-api.nvidia.com:172.18.0.1"
+    volumes:
+      - ./secrets/copilot_opus_api_key:/run/secrets/copilot_opus_api_key:ro
+
+  cvat_worker_annotation:
+    environment:
+      COPILOT_LLM_URL: "https://inference-api.nvidia.com:8443/v1/chat/completions"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "inference-api.nvidia.com:172.18.0.1"
+    volumes:
+      - ./secrets/copilot_opus_api_key:/run/secrets/copilot_opus_api_key:ro
+
+  # Temporal predictor (V-JEPA-2.1 + ASFormer). Reuses the cvat-sam3 image.
+  # Source (server + vjepa2 + asformer + inference_guides) is vendored in-repo and
+  # mounted read-only; only the weights come from the external bundle.
+  temporal_predictor:
+    image: cvat-sam3:latest
+    container_name: openhv2_temporal
+    restart: unless-stopped
+    working_dir: /opt/temporal
+    command: ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8091"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SURGVID_VJEPA2_REPO: /opt/vendor/vjepa2
+      SURGVID_ASFORMER_DIR: /opt/vendor/asformer_model
+      SURGVID_INFER_DIR: /opt/infer_guides
+      ASFORMER_CHECKPOINT: /opt/weights/asformer_best.pt
+      ASFORMER_CONFIG: /opt/weights/asformer_config.yaml
+      VJEPA_BACKBONE: /opt/weights/vjepa2_1_vitl_dist_vitG_384.pt
+      TEMPORAL_DATASET_ROOTS: /data/prostatectomy:/data/prostatectomy_suture_knot_focused
+      TORCH_HOME: /tmp/torch
+    volumes:
+      - ./components/temporal_predictor:/opt/temporal:ro
+      - ./components/vendor/vjepa2:/opt/vendor/vjepa2:ro
+      - ./components/vendor/asformer_model:/opt/vendor/asformer_model:ro
+      - ./components/inference_guides:/opt/infer_guides:ro
+      - ${OPENHV2_TEMPORAL_WEIGHTS:-/mnt/big_drive/models/openhv2/temporal}:/opt/weights:ro
+      - ${OPENHV2_DATASET_PROST:-/mnt/big_drive/datasets/prostatectomy}:/data/prostatectomy:ro
+      - ${OPENHV2_DATASET_PROST_SUTURE:-/mnt/big_drive/datasets/prostatectomy_suture_knot_focused}:/data/prostatectomy_suture_knot_focused:ro
+    ports:
+      - "127.0.0.1:18091:8091"
+    networks:
+      - cvat
+
+  # TAPIS (GraSP MViT) surgical-PHASE predictor. Reuses the cvat-sam3 image.
+  tapis_phase_predictor:
+    image: cvat-sam3:latest
+    container_name: openhv2_tapis_phase
+    restart: unless-stopped
+    working_dir: /opt/tapis
+    command: ["bash", "-c", "pip install --quiet --no-input fvcore simplejson && exec python -m uvicorn server:app --host 0.0.0.0 --port 8602"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      TAPIS_ROOT: /opt/tapis_code
+      TAPIS_STUBS: /opt/tapis_stubs
+      TAPIS_PHASE_CHECKPOINT: /opt/models/fold1/PHASES.pyth
+      TAPIS_PHASE_CONFIG: /opt/tapis_code/configs/GraSP/TAPIS/TAPIS_PHASES.yaml
+      TEMPORAL_DATASET_ROOTS: /data/prostatectomy:/data/prostatectomy_suture_knot_focused
+      TAPIS_KEYFRAME_EVERY_S: "1"
+      TORCH_HOME: /tmp/torch
+    volumes:
+      - ./components/tapis_phase_predictor:/opt/tapis:ro
+      - ${OPENHV2_TAPIS_CODE:-/mnt/ssd2/GraSP/TAPIS}:/opt/tapis_code:ro
+      - ./components/tapis_phase/stubs:/opt/tapis_stubs:ro
+      - ${OPENHV2_TAPIS_MODELS:-/mnt/big_drive/models/openhv2/tapis}:/opt/models:ro
+      - ${OPENHV2_DATASET_PROST:-/mnt/big_drive/datasets/prostatectomy}:/data/prostatectomy:ro
+      - ${OPENHV2_DATASET_PROST_SUTURE:-/mnt/big_drive/datasets/prostatectomy_suture_knot_focused}:/data/prostatectomy_suture_knot_focused:ro
+    ports:
+      - "127.0.0.1:18602:8602"
+    networks:
+      - cvat
+
+  sam3:
+    container_name: openhv2_sam3
+    build:
+      context: .
+      dockerfile: components/sam3/Dockerfile
+      network: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SAM3_ROOT: /opt/sam3
+      SAM3_CHECKPOINT_DIR: /opt/checkpoints
+      SAM3_BASE_CHECKPOINT: /opt/checkpoints/Altas_Sam3.pt
+      SAM3_WARMUP_ON_STARTUP: ${SAM3_WARMUP_ON_STARTUP:-0}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./components/vendor/repo_sam3.1:/opt/sam3:ro
+      - ${OPENHV2_SAM3_CKPT_DIR:-/mnt/big_drive/models/openhv2/sam3/checkpoints}:/opt/checkpoints:ro
+      - ${OPENHV2_HF_CACHE:-/mnt/big_drive/models/openhv2/cache/hf}:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:18090:8090"
+    networks:
+      - cvat
+
+  # Parakeet ASR sidecar (NeMo). surgnarr is vendored in-repo (with the Hypothesis-repr
+  # fix) and mounted read-only.
+  parakeet:
+    container_name: openhv2_parakeet
+    build:
+      context: components/parakeet_asr
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      SURGNARR_SRC: /opt/surgnarr/src
+      PARAKEET_MODEL: ${PARAKEET_MODEL:-nvidia/parakeet-tdt-1.1b}
+      PARAKEET_DEVICE: cuda
+      HF_HOME: /opt/hf
+    volumes:
+      - ./components/surgnarr_src:/opt/surgnarr/src:ro
+      - ${OPENHV2_PARAKEET_HF:-/mnt/big_drive/models/openhv2/cache/hf}:/opt/hf
+    ports:
+      - "127.0.0.1:18888:8888"
+    networks:
+      - cvat
