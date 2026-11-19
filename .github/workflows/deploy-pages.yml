@@ -1,0 +1,75 @@
+name: Deploy site to GitHub Pages
+
+# Pull requests only build and validate. Publishing is manual: run this
+# workflow from main, name the release folder, and approve the deployment
+# in the github-pages environment.
+on:
+  pull_request:
+    paths:
+      - "website-releases/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Folder under website-releases/ to publish"
+        required: true
+        default: "20261019-hospital-release"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  RELEASE: ${{ inputs.release || '20261019-hospital-release' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage site files
+        run: |
+          set -euo pipefail
+          case "$RELEASE" in
+            *[!A-Za-z0-9._-]*|"") echo "Invalid release name: $RELEASE"; exit 1 ;;
+          esac
+          src="website-releases/$RELEASE/source"
+          [ -f "$src/index.html" ] || { echo "No index.html in $src"; exit 1; }
+          mkdir _site
+          cp "$src"/index.html _site/
+          cp "$src"/*.css "$src"/*.js _site/
+          cp -R "$src"/assets _site/assets
+
+      - name: Check that every referenced file exists
+        run: |
+          set -euo pipefail
+          missing=0
+          for ref in $(grep -oE '(src|href)="/[^"/][^"]*"' _site/index.html | sed -E 's/^(src|href)="//; s/"$//'); do
+            if [ ! -f "_site$ref" ]; then echo "Missing: $ref"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All referenced files present in release $RELEASE"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
